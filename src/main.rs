@@ -74,7 +74,7 @@ fn generate_tagger_pair(entry: &DirEntry) -> anyhow::Result<Option<(String, Tagg
 
 fn generate_taggers(dir: &Path) -> anyhow::Result<HashMap<String, TaggerFile>> {
     let mut taggers = HashMap::new();
-    let mut dir_iter = WalkDir::new(dir).into_iter();
+    let mut dir_iter = WalkDir::new(dir).follow_links(true).into_iter();
 
     while let Some(Ok(entry)) = dir_iter.next() {
         if let Some((loc, f)) = generate_tagger_pair(&entry)? {
@@ -93,7 +93,7 @@ fn process_directory_tree(
     let mut tag_hits = TaggedFiles::default();
     let taggers = generate_taggers(dir)?;
 
-    let mut dir_iter = WalkDir::new(dir).into_iter();
+    let mut dir_iter = WalkDir::new(dir).follow_links(true).into_iter();
 
     while let Some(Ok(entry)) = dir_iter.next() {
         let parent = entry
@@ -192,7 +192,8 @@ impl TaggerFile {
         for line in &self.0 {
             match line {
                 TaggerLine::Tag(f, tags) => {
-                    if f != target_filename {
+                    let filename_matcher = Regex::new(f).unwrap();
+                    if !filename_matcher.is_match(target_filename) {
                         return None;
                     }
                     for t in tags {
