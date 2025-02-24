@@ -1,6 +1,7 @@
 use anyhow::Context;
 use clap::Parser;
 use once_cell::sync::Lazy;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -16,7 +17,7 @@ struct Args {
     #[arg(required = true)]
     dirs: Vec<std::path::PathBuf>,
 
-    /// The tags to search for.
+    /// Regular expressions representing the tags to match on.
     #[arg(required = true, last = true)]
     tags: Vec<String>,
 }
@@ -97,8 +98,12 @@ fn process_directory_tree(dir: &Path, tags: &Vec<String>) -> anyhow::Result<Tagg
         match taggers.get(parent) {
             Some(tagger_file) => {
                 for tag in tags {
-                    if tagger_file.has_match(tag, &entry.file_name().to_string_lossy()) {
-                        tag_hits.add(tag, entry.path())?;
+                    if let Some(ts) =
+                        tagger_file.has_match(tag, &entry.file_name().to_string_lossy())
+                    {
+                        for t in ts {
+                            tag_hits.add(t, entry.path())?;
+                        }
                     }
                 }
             }
@@ -109,8 +114,10 @@ fn process_directory_tree(dir: &Path, tags: &Vec<String>) -> anyhow::Result<Tagg
                         continue;
                     };
 
-                    if tagger.has_match(tag, &entry.file_name().to_string_lossy()) {
-                        tag_hits.add(tag, entry.path())?;
+                    if let Some(ts) = tagger.has_match(tag, &entry.file_name().to_string_lossy()) {
+                        for t in ts {
+                            tag_hits.add(t, entry.path())?;
+                        }
                     }
                 }
             }
@@ -168,18 +175,29 @@ impl TaggerFile {
         )]))
     }
 
-    fn has_match(&self, target_tag: &String, target_filename: &str) -> bool {
+    fn has_match(&self, target_tag: &String, target_filename: &str) -> Option<Vec<&String>> {
+        let target_tag = Regex::new(target_tag).unwrap();
+        let mut matches = vec![];
         for line in &self.0 {
             match line {
                 TaggerLine::Tag(f, tags) => {
-                    if f == target_filename && tags.contains(target_tag) {
-                        return true;
+                    if f != target_filename {
+                        return None;
+                    }
+                    for t in tags {
+                        if target_tag.is_match(t) {
+                            matches.push(t);
+                        }
                     }
                 }
             }
         }
 
-        return false;
+        if matches.is_empty() {
+            None
+        } else {
+            Some(matches)
+        }
     }
 }
 
