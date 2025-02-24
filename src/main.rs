@@ -1,116 +1,123 @@
+use anyhow::Context;
+use clap::Parser;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use walkdir::WalkDir;
+use std::path::Path;
+use walkdir::{DirEntry, WalkDir};
 
 static TAGGER_FILE_NAMES: Lazy<HashSet<&'static str>> =
     Lazy::new(|| HashSet::from([".tagger.yaml", "tagger.yaml"]));
 
-fn main() -> anyhow::Result<()> {
-    let results =
-        process_directory_tree("./example", vec!["src".to_string(), "test-tag".to_string()]);
-    println!("{results:?}");
-    Ok(())
+#[derive(Parser)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// The directories to operate on.
+    #[arg(required = true)]
+    dirs: Vec<std::path::PathBuf>,
+
+    /// The tags to search for.
+    #[arg(required = true, last = true)]
+    tags: Vec<String>,
 }
 
-fn process_directory_tree(dir: &str, tags: Vec<String>) -> TaggedFiles {
-    let mut taggers = HashMap::new();
-    let mut cache_misses = HashSet::new();
-    let mut tag_hits = TaggedFiles::default();
+fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
 
-    for entry in WalkDir::new(dir) {
-        let Ok(entry) = entry else {
-            eprintln!("error reading a file, dont know which one");
-            continue;
-        };
+    let results = args
+        .dirs
+        .iter()
+        .map(|path| process_directory_tree(path, &args.tags))
+        .collect::<anyhow::Result<Vec<TaggedFiles>>>()?;
 
-        let Some(current_name) = entry.file_name().to_str() else {
-            eprintln!("{entry:?} does not have a utf8 filename");
-            continue;
-        };
-
-        let Some(parent) = entry.path().parent().map(|p| p.to_str()).flatten() else {
-            eprintln!("{entry:?} does not have a parent");
-            continue;
-        };
-
-        if TAGGER_FILE_NAMES.contains(current_name) {
-            let Ok(tagger_yaml) = std::fs::read_to_string(entry.path()) else {
-                eprintln!("{entry:?} could not be read");
-                continue;
-            };
-
-            match TaggerFile::new(tagger_yaml) {
-                Ok(file) => {
-                    taggers.insert(parent.to_string(), file);
-                }
-                Err(e) => eprintln!("failed to read tagger file {entry:?}: {e:?}"),
-            }
-        } else {
-            match taggers.get(parent) {
-                Some(tagger_file) => {
-                    for tag in &tags {
-                        if tagger_file.has_match(tag, &entry.file_name().to_string_lossy()) {
-                            let Ok(()) = tag_hits.add(tag, entry.path()) else {
-                                eprintln!("failed to add tag hit {entry:?} for {tag}");
-                                continue;
-                            };
-                        }
-                    }
-                }
-                None => {
-                    let Ok(miss) = entry.clone().into_path().canonicalize() else {
-                        eprintln!(
-                            "skipping cache miss {entry:?} because it failed to canonicalize"
-                        );
-                        continue;
-                    };
-                    cache_misses.insert(miss);
-                }
-            }
+    let mut deduplicated = HashMap::new();
+    for tagged_file in results.into_iter() {
+        for (k, v) in tagged_file.0.into_iter() {
+            deduplicated
+                .entry(k)
+                .and_modify(|existing: &mut HashSet<String>| existing.extend(v.clone()))
+                .or_insert(HashSet::from_iter(v.into_iter()));
         }
     }
 
-    for target in cache_misses {
-        match taggers.get(&target.parent().unwrap().to_string_lossy().to_string()) {
+    println!("{}", serde_yaml::to_string(&deduplicated)?);
+
+    Ok(())
+}
+
+fn generate_tagger_pair(entry: &DirEntry) -> anyhow::Result<Option<(String, TaggerFile)>> {
+    if !TAGGER_FILE_NAMES.contains(
+        entry
+            .file_name()
+            .to_str()
+            .context("{entry:?} filename not utf8")?,
+    ) {
+        return Ok(None);
+    }
+
+    let parent = entry
+        .path()
+        .parent()
+        .map(|p| p.to_str())
+        .flatten()
+        .context("no parent found")?;
+
+    Ok(Some((
+        parent.to_string(),
+        TaggerFile::new(std::fs::read_to_string(entry.path())?)?,
+    )))
+}
+
+fn generate_taggers(dir: &Path) -> anyhow::Result<HashMap<String, TaggerFile>> {
+    let mut taggers = HashMap::new();
+    let mut dir_iter = WalkDir::new(dir).into_iter();
+
+    while let Some(Ok(entry)) = dir_iter.next() {
+        if let Some((loc, f)) = generate_tagger_pair(&entry)? {
+            taggers.insert(loc, f);
+        }
+    }
+
+    Ok(taggers)
+}
+
+fn process_directory_tree(dir: &Path, tags: &Vec<String>) -> anyhow::Result<TaggedFiles> {
+    let mut tag_hits = TaggedFiles::default();
+    let taggers = generate_taggers(dir)?;
+
+    let mut dir_iter = WalkDir::new(dir).into_iter();
+
+    while let Some(Ok(entry)) = dir_iter.next() {
+        let parent = entry
+            .path()
+            .parent()
+            .map(|p| p.to_str())
+            .flatten()
+            .context("no parent found")?;
+        match taggers.get(parent) {
             Some(tagger_file) => {
-                for tag in &tags {
-                    if tagger_file.has_match(tag, &target.file_name().unwrap().to_string_lossy()) {
-                        let Ok(()) = tag_hits.add(tag, target.as_path()) else {
-                            eprintln!("failed to add tag hit {target:?} for {tag}");
-                            continue;
-                        };
+                for tag in tags {
+                    if tagger_file.has_match(tag, &entry.file_name().to_string_lossy()) {
+                        tag_hits.add(tag, entry.path())?;
                     }
                 }
             }
             None => {
-                let Some(parent_file_name) = target.parent().map(|p| p.file_name()).flatten()
-                else {
-                    eprintln!("failed to extract file name from parent of {target:?}");
-                    continue;
-                };
+                for tag in tags {
+                    let Some(tagger) = TaggerFile::with_dir_tag(&entry) else {
+                        // not a dir
+                        continue;
+                    };
 
-                for tag in &tags {
-                    if TaggerFile::from_dir(
-                        target.to_string_lossy().to_string(),
-                        target.parent().unwrap(),
-                    )
-                    .unwrap()
-                    .has_match(tag, &target.to_string_lossy())
-                    {
-                        let Ok(()) =
-                            tag_hits.add(&parent_file_name.to_string_lossy(), target.as_path())
-                        else {
-                            eprintln!("failed to add {target:?} with tag of parent directory");
-                            continue;
-                        };
+                    if tagger.has_match(tag, &entry.file_name().to_string_lossy()) {
+                        tag_hits.add(tag, entry.path())?;
                     }
                 }
             }
         }
     }
 
-    tag_hits
+    Ok(tag_hits)
 }
 
 #[derive(Default, Debug)]
@@ -143,18 +150,22 @@ impl TaggerFile {
         Ok(Self(serde_yaml::from_str(&yaml)?))
     }
 
-    fn from_dir(target: String, dir: &std::path::Path) -> Option<Self> {
-        if !dir.is_dir() {
+    fn with_dir_tag(target: &DirEntry) -> Option<Self> {
+        if target.path().is_dir() {
             return None;
         }
 
-        let s = Some(Self(vec![TaggerLine::Tag(
-            target,
-            vec![dir.file_name().unwrap().to_string_lossy().to_string()],
-        )]));
-
-        println!("{s:?}");
-        s
+        Some(Self(vec![TaggerLine::Tag(
+            target.file_name().to_string_lossy().to_string(),
+            vec![target
+                .path()
+                .canonicalize()
+                .ok()?
+                .parent()?
+                .file_name()?
+                .to_string_lossy()
+                .to_string()],
+        )]))
     }
 
     fn has_match(&self, target_tag: &String, target_filename: &str) -> bool {
