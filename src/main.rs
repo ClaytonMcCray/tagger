@@ -10,7 +10,7 @@ use walkdir::{DirEntry, WalkDir};
 static TAGGER_FILE_NAMES: Lazy<HashSet<&'static str>> =
     Lazy::new(|| HashSet::from([".tagger.yaml", "tagger.yaml"]));
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
     /// The directories to operate on.
@@ -20,6 +20,9 @@ struct Args {
     /// Regular expressions representing the tags to match on.
     #[arg(required = true, last = true)]
     tags: Vec<String>,
+
+    #[arg(long, short, action = clap::ArgAction::SetTrue)]
+    suppress_auto_dir_tagging: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -28,7 +31,7 @@ fn main() -> anyhow::Result<()> {
     let results = args
         .dirs
         .iter()
-        .map(|path| process_directory_tree(path, &args.tags))
+        .map(|path| process_directory_tree(path, &args.tags, args.suppress_auto_dir_tagging))
         .collect::<anyhow::Result<Vec<TaggedFiles>>>()?;
 
     let mut deduplicated = HashMap::new();
@@ -82,7 +85,11 @@ fn generate_taggers(dir: &Path) -> anyhow::Result<HashMap<String, TaggerFile>> {
     Ok(taggers)
 }
 
-fn process_directory_tree(dir: &Path, tags: &Vec<String>) -> anyhow::Result<TaggedFiles> {
+fn process_directory_tree(
+    dir: &Path,
+    tags: &Vec<String>,
+    suppress_auto_dir_tagging: bool,
+) -> anyhow::Result<TaggedFiles> {
     let mut tag_hits = TaggedFiles::default();
     let taggers = generate_taggers(dir)?;
 
@@ -108,6 +115,10 @@ fn process_directory_tree(dir: &Path, tags: &Vec<String>) -> anyhow::Result<Tagg
                 }
             }
             None => {
+                if suppress_auto_dir_tagging {
+                    continue;
+                }
+
                 for tag in tags {
                     let Some(tagger) = TaggerFile::with_dir_tag(&entry) else {
                         // not a dir
