@@ -4,6 +4,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::io;
 use std::path::Path;
 use walkdir::{DirEntry, WalkDir};
 
@@ -18,20 +19,23 @@ struct Args {
     dirs: Vec<std::path::PathBuf>,
 
     /// Regular expressions representing the tags to match on.
-    #[arg(required = true, last = true)]
-    tags: Vec<String>,
-
-    #[arg(long, short, action = clap::ArgAction::SetTrue)]
-    suppress_auto_dir_tagging: bool,
+    /// Leave out for interactive mode.
+    #[arg(long, short)]
+    tags: Option<Vec<String>>,
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
+    let (interactive, tags) = match args.tags {
+        Some(tags) => (false, tags),
+        None => (true, interactive_get_tags()?),
+    };
+
     let results = args
         .dirs
         .iter()
-        .map(|path| process_directory_tree(path, &args.tags, args.suppress_auto_dir_tagging))
+        .map(|path| process_directory_tree(path, &tags))
         .collect::<anyhow::Result<Vec<TaggedFiles>>>()?;
 
     let mut deduplicated = HashMap::new();
@@ -46,7 +50,30 @@ fn main() -> anyhow::Result<()> {
 
     println!("{}", serde_yaml::to_string(&deduplicated)?);
 
+    if interactive {
+        wait_for_input()?;
+    }
+
     Ok(())
+}
+
+fn wait_for_input() -> Result<(), io::Error> {
+    println!("\npress enter to quit");
+    let mut input = String::default();
+    io::stdin().read_line(&mut input)?;
+    Ok(())
+}
+
+fn interactive_get_tags() -> Result<Vec<String>, io::Error> {
+    print!("Search (white-space separated): ");
+    io::Write::flush(&mut io::stdout())?;
+    let mut input = String::default();
+    io::stdin().read_line(&mut input)?;
+    Ok(input
+        .split(" ")
+        .map(str::trim)
+        .map(str::to_string)
+        .collect())
 }
 
 fn generate_tagger_pair(entry: &DirEntry) -> anyhow::Result<Option<(String, TaggerFile)>> {
@@ -85,11 +112,7 @@ fn generate_taggers(dir: &Path) -> anyhow::Result<HashMap<String, TaggerFile>> {
     Ok(taggers)
 }
 
-fn process_directory_tree(
-    dir: &Path,
-    tags: &Vec<String>,
-    suppress_auto_dir_tagging: bool,
-) -> anyhow::Result<TaggedFiles> {
+fn process_directory_tree(dir: &Path, tags: &Vec<String>) -> anyhow::Result<TaggedFiles> {
     let mut tag_hits = TaggedFiles::default();
     let taggers = generate_taggers(dir)?;
 
@@ -114,24 +137,7 @@ fn process_directory_tree(
                     }
                 }
             }
-            None => {
-                if suppress_auto_dir_tagging {
-                    continue;
-                }
-
-                for tag in tags {
-                    let Some(tagger) = TaggerFile::with_dir_tag(&entry) else {
-                        // not a dir
-                        continue;
-                    };
-
-                    if let Some(ts) = tagger.has_match(tag, &entry.file_name().to_string_lossy()) {
-                        for t in ts {
-                            tag_hits.add(t, entry.path())?;
-                        }
-                    }
-                }
-            }
+            None => {}
         }
     }
 
@@ -166,24 +172,6 @@ struct TaggerFile(Vec<TaggerLine>);
 impl TaggerFile {
     fn new(yaml: String) -> Result<Self, serde_yaml::Error> {
         Ok(Self(serde_yaml::from_str(&yaml)?))
-    }
-
-    fn with_dir_tag(target: &DirEntry) -> Option<Self> {
-        if target.path().is_dir() {
-            return None;
-        }
-
-        Some(Self(vec![TaggerLine::Tag(
-            target.file_name().to_string_lossy().to_string(),
-            vec![target
-                .path()
-                .canonicalize()
-                .ok()?
-                .parent()?
-                .file_name()?
-                .to_string_lossy()
-                .to_string()],
-        )]))
     }
 
     fn has_match(&self, target_tag: &String, target_filename: &str) -> Option<Vec<&String>> {
