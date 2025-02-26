@@ -1,11 +1,12 @@
 use anyhow::Context;
 use clap::Parser;
+use itertools::Itertools;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use walkdir::{DirEntry, WalkDir};
 
 static TAGGER_FILE_NAMES: Lazy<HashSet<&'static str>> =
@@ -35,8 +36,9 @@ fn main() -> anyhow::Result<()> {
     let results = args
         .dirs
         .iter()
-        .map(|path| process_directory_tree(path, &tags))
-        .collect::<anyhow::Result<Vec<TaggedFiles>>>()?;
+        .map(|path| path.canonicalize())
+        .map_ok(|path| process_directory_tree(&path, &tags))
+        .collect::<Result<anyhow::Result<Vec<TaggedFiles>>, _>>()??;
 
     let mut deduplicated = HashMap::new();
     for tagged_file in results.into_iter() {
@@ -101,7 +103,7 @@ fn generate_tagger_pair(entry: &DirEntry) -> anyhow::Result<Option<(String, Tagg
 
 fn generate_taggers(dir: &Path) -> anyhow::Result<HashMap<String, TaggerFile>> {
     let mut taggers = HashMap::new();
-    let mut dir_iter = WalkDir::new(dir).follow_links(true).into_iter();
+    let mut dir_iter = WalkDir::new(dir).follow_links(false).into_iter();
 
     while let Some(Ok(entry)) = dir_iter.next() {
         if let Some((loc, f)) = generate_tagger_pair(&entry)? {
@@ -116,7 +118,7 @@ fn process_directory_tree(dir: &Path, tags: &Vec<String>) -> anyhow::Result<Tagg
     let mut tag_hits = TaggedFiles::default();
     let taggers = generate_taggers(dir)?;
 
-    let mut dir_iter = WalkDir::new(dir).follow_links(true).into_iter();
+    let mut dir_iter = WalkDir::new(dir).follow_links(false).into_iter();
 
     while let Some(Ok(entry)) = dir_iter.next() {
         let parent = entry
@@ -129,10 +131,10 @@ fn process_directory_tree(dir: &Path, tags: &Vec<String>) -> anyhow::Result<Tagg
             Some(tagger_file) => {
                 for tag in tags {
                     if let Some(ts) =
-                        tagger_file.has_match(tag, &entry.file_name().to_string_lossy())
+                        tagger_file.has_match(tag, entry.path())
                     {
-                        for t in ts {
-                            tag_hits.add(t, entry.path())?;
+                        for (t, hit) in ts {
+                            tag_hits.add(t, hit.as_path())?;
                         }
                     }
                 }
@@ -150,11 +152,11 @@ struct TaggedFiles(HashMap<String, Vec<String>>);
 impl TaggedFiles {
     fn add(&mut self, tag: &str, hit: &std::path::Path) -> Result<(), std::io::Error> {
         if let Some(hits) = self.0.get_mut(tag) {
-            hits.push(hit.canonicalize()?.to_string_lossy().to_string());
+            hits.push(hit.to_string_lossy().to_string());
         } else {
             self.0.insert(
                 tag.to_string(),
-                vec![hit.canonicalize()?.to_string_lossy().to_string()],
+                vec![hit.to_string_lossy().to_string()],
             );
         }
         Ok(())
@@ -164,6 +166,7 @@ impl TaggedFiles {
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 enum TaggerLine {
     Tag(String, Vec<String>),
+    DirTag(Vec<String>),
 }
 
 #[derive(Debug)]
@@ -174,22 +177,32 @@ impl TaggerFile {
         Ok(Self(serde_yaml::from_str(&yaml)?))
     }
 
-    fn has_match(&self, target_tag: &String, target_filename: &str) -> Option<Vec<&String>> {
+    fn has_match(&self, target_tag: &String, target_file: &Path) -> Option<Vec<(&String, PathBuf)>> {
         let target_tag = Regex::new(target_tag).unwrap();
+        let target_filename = target_file.file_name()?.to_string_lossy();
         let mut matches = vec![];
         for line in &self.0 {
             match line {
-                TaggerLine::Tag(f, tags) => {
+                TaggerLine::Tag(f, tags) if target_file.is_file() => {
                     let filename_matcher = Regex::new(f).unwrap();
-                    if !filename_matcher.is_match(target_filename) {
+                    if !filename_matcher.is_match(&target_filename) {
                         return None;
                     }
                     for t in tags {
                         if target_tag.is_match(t) {
-                            matches.push(t);
+                            matches.push((t, target_file.to_path_buf()));
                         }
                     }
                 }
+                TaggerLine::DirTag(tags) => {
+                    for t in tags {
+                        if target_tag.is_match(t) {
+                            matches.push((t, target_file.parent()?.to_path_buf()));
+                        }
+                    }
+                }
+
+                _ => {},
             }
         }
 
