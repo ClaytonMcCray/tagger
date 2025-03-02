@@ -4,7 +4,7 @@ use itertools::Itertools;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use walkdir::{DirEntry, WalkDir};
@@ -12,21 +12,47 @@ use walkdir::{DirEntry, WalkDir};
 static TAGGER_FILE_NAMES: Lazy<HashSet<&'static str>> =
     Lazy::new(|| HashSet::from([".tagger.yaml", "tagger.yaml"]));
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Serialize, Deserialize, PartialEq, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// The directories to operate on.
-    #[arg(required = true)]
-    dirs: Vec<std::path::PathBuf>,
+    /// The directories to operate on. May be left out only if a config at
+    /// ~/.config/tagger/settings.yaml specifies the dirs.
+    #[arg(long, short)]
+    dirs: Option<Vec<std::path::PathBuf>>,
 
     /// Regular expressions representing the tags to match on.
     /// Leave out for interactive mode.
-    #[arg(long, short)]
+    #[arg()]
     tags: Option<Vec<String>>,
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+
+    let args = if args.dirs.is_none() {
+        let mut new_args: Args = serde_yaml::from_str(&std::fs::read_to_string(
+            home::home_dir()
+                .expect("home dir")
+                .join(".config/tagger/settings.yaml"),
+        )?)?;
+        new_args.dirs = new_args.dirs.map(|dirs| {
+            dirs.into_iter()
+                .map(|d| {
+                    glob::glob(&d.to_string_lossy())
+                        .into_iter()
+                        .map(|paths| paths.into_iter())
+                        .flatten()
+                        .collect::<Vec<Result<PathBuf, _>>>()
+                })
+                .flatten()
+                .collect::<Result<Vec<_>, _>>()
+                .expect("globbing")
+        });
+        new_args.tags = args.tags;
+        new_args
+    } else {
+        args
+    };
 
     let (interactive, tags) = match args.tags {
         Some(tags) => (false, tags),
@@ -35,18 +61,19 @@ fn main() -> anyhow::Result<()> {
 
     let results = args
         .dirs
+        .unwrap()
         .iter()
         .map(|path| path.canonicalize())
         .map_ok(|path| process_directory_tree(&path, &tags))
         .collect::<Result<anyhow::Result<Vec<TaggedFiles>>, _>>()??;
 
-    let mut deduplicated = HashMap::new();
+    let mut deduplicated = BTreeMap::new();
     for tagged_file in results.into_iter() {
         for (k, v) in tagged_file.0.into_iter() {
             deduplicated
                 .entry(k)
-                .and_modify(|existing: &mut HashSet<String>| existing.extend(v.clone()))
-                .or_insert(HashSet::from_iter(v.into_iter()));
+                .and_modify(|existing: &mut BTreeSet<String>| existing.extend(v.clone()))
+                .or_insert(BTreeSet::from_iter(v.into_iter()));
         }
     }
 
@@ -130,9 +157,7 @@ fn process_directory_tree(dir: &Path, tags: &Vec<String>) -> anyhow::Result<Tagg
         match taggers.get(parent) {
             Some(tagger_file) => {
                 for tag in tags {
-                    if let Some(ts) =
-                        tagger_file.has_match(tag, entry.path())
-                    {
+                    if let Some(ts) = tagger_file.has_match(tag, entry.path()) {
                         for (t, hit) in ts {
                             tag_hits.add(t, hit.as_path())?;
                         }
@@ -154,10 +179,8 @@ impl TaggedFiles {
         if let Some(hits) = self.0.get_mut(tag) {
             hits.push(hit.to_string_lossy().to_string());
         } else {
-            self.0.insert(
-                tag.to_string(),
-                vec![hit.to_string_lossy().to_string()],
-            );
+            self.0
+                .insert(tag.to_string(), vec![hit.to_string_lossy().to_string()]);
         }
         Ok(())
     }
@@ -177,7 +200,11 @@ impl TaggerFile {
         Ok(Self(serde_yaml::from_str(&yaml)?))
     }
 
-    fn has_match(&self, target_tag: &String, target_file: &Path) -> Option<Vec<(&String, PathBuf)>> {
+    fn has_match(
+        &self,
+        target_tag: &String,
+        target_file: &Path,
+    ) -> Option<Vec<(&String, PathBuf)>> {
         let target_tag = Regex::new(target_tag).unwrap();
         let target_filename = target_file.file_name()?.to_string_lossy();
         let mut matches = vec![];
@@ -202,7 +229,7 @@ impl TaggerFile {
                     }
                 }
 
-                _ => {},
+                _ => {}
             }
         }
 
