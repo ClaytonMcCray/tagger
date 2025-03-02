@@ -1,6 +1,5 @@
 use anyhow::Context;
 use clap::Parser;
-use itertools::Itertools;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -41,16 +40,14 @@ fn main() -> anyhow::Result<()> {
         )?)?;
         new_args.dirs = new_args.dirs.map(|dirs| {
             dirs.into_iter()
-                .map(|d| {
-                    glob::glob(&d.to_string_lossy())
-                        .into_iter()
-                        .map(|paths| paths.into_iter())
-                        .flatten()
-                        .collect::<Vec<Result<PathBuf, _>>>()
+                .flat_map(|d| match glob::glob(&d.to_string_lossy()) {
+                    Ok(paths) => paths.filter_map(Result::ok).collect::<Vec<_>>(),
+                    Err(e) => {
+                        eprintln!("Error expanding glob pattern '{}': {}", d.display(), e);
+                        Vec::new()
+                    }
                 })
-                .flatten()
-                .collect::<Result<Vec<_>, _>>()
-                .expect("globbing")
+                .collect()
         });
         new_args.tags = args.tags;
         new_args.or = if args.or { args.or } else { new_args.or };
@@ -73,9 +70,21 @@ fn main() -> anyhow::Result<()> {
         .dirs
         .unwrap()
         .iter()
-        .map(|path| path.canonicalize())
-        .map_ok(|path| process_directory_tree(&path, &tags))
-        .collect::<Result<anyhow::Result<Vec<TaggedFiles>>, _>>()??;
+        .filter_map(|path| match path.canonicalize() {
+            Ok(path) => Some(path),
+            Err(e) => {
+                eprintln!("error canonicalizing: {e:?}");
+                None
+            }
+        })
+        .filter_map(|path| match process_directory_tree(&path, &tags) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                eprintln!("error processing tree {path:?}: {e:?}");
+                None
+            }
+        })
+        .collect::<Vec<TaggedFiles>>();
 
     let mut deduplicated = BTreeMap::new();
     for tagged_file in results.into_iter() {
@@ -100,13 +109,13 @@ fn main() -> anyhow::Result<()> {
     }
 
     if interactive {
-        wait_for_input()?;
+        wait_for_input_to_quit()?;
     }
 
     Ok(())
 }
 
-fn wait_for_input() -> Result<(), io::Error> {
+fn wait_for_input_to_quit() -> Result<(), io::Error> {
     println!("\npress enter to quit");
     let mut input = String::default();
     io::stdin().read_line(&mut input)?;
@@ -126,20 +135,9 @@ fn interactive_get_tags() -> Result<Vec<String>, io::Error> {
 }
 
 fn get_intersection_of_tag_hits(map: BTreeMap<String, BTreeSet<String>>) -> BTreeSet<String> {
-    if map.is_empty() {
-        return BTreeSet::default();
-    }
-
-    let mut intersection: Option<BTreeSet<String>> = None;
-    for (_, set) in map {
-        if intersection.is_none() {
-            intersection = Some(set);
-        } else {
-            intersection = Some(intersection.unwrap().intersection(&set).cloned().collect());
-        }
-    }
-
-    intersection.unwrap_or_default()
+    map.into_values()
+        .reduce(|acc, set| acc.intersection(&set).cloned().collect())
+        .unwrap_or_default()
 }
 
 fn generate_tagger_pair(entry: &DirEntry) -> anyhow::Result<Option<(PathBuf, TaggerFile)>> {
@@ -233,14 +231,12 @@ enum TaggerLine {
     DirTag(Vec<String>),
 }
 
-impl From<TaggerLineRaw> for TaggerLine {
-    fn from(input: TaggerLineRaw) -> TaggerLine {
+impl TryFrom<TaggerLineRaw> for TaggerLine {
+    type Error = regex::Error;
+    fn try_from(input: TaggerLineRaw) -> Result<TaggerLine, Self::Error> {
         match input {
-            TaggerLineRaw::Tag(f, tags) => TaggerLine::Tag(
-                Regex::new(&f).expect("filename specifiers must be regexes"),
-                tags,
-            ),
-            TaggerLineRaw::DirTag(tags) => TaggerLine::DirTag(tags),
+            TaggerLineRaw::Tag(f, tags) => Ok(TaggerLine::Tag(Regex::new(&f)?, tags)),
+            TaggerLineRaw::DirTag(tags) => Ok(TaggerLine::DirTag(tags)),
         }
     }
 }
@@ -251,7 +247,18 @@ struct TaggerFile(Vec<TaggerLine>);
 impl TaggerFile {
     fn new(yaml: String) -> Result<Self, serde_yaml::Error> {
         let lines: Vec<TaggerLineRaw> = serde_yaml::from_str(&yaml)?;
-        Ok(Self(lines.into_iter().map(TaggerLine::from).collect()))
+        Ok(Self(
+            lines
+                .into_iter()
+                .filter_map(|line| match TaggerLine::try_from(line) {
+                    Ok(line) => Some(line),
+                    Err(e) => {
+                        eprintln!("error processing tagger file: {e:?}");
+                        None
+                    }
+                })
+                .collect(),
+        ))
     }
 
     fn has_match(&self, target_tag: &Regex, target_file: &Path) -> Option<Vec<(&String, PathBuf)>> {
