@@ -25,3 +25,13 @@ looking for `.tagger.yaml` or `tagger.yaml` files from each of the provided file
 - !Tag ["\\.png$", [group-trip, photos]]
 ```
 
+# Config files
+
+You can put a settings file at `~/.config/tagger/settings.yaml` to pre-configure directories:
+
+```
+dirs: [/Users/username/one, /Users/username/two/*]
+```
+
+Globbing should work as it does in the shell.
+
