@@ -184,6 +184,15 @@ fn process_directory_tree(dir: &Path, tags: &Vec<Regex>) -> anyhow::Result<Tagge
     for (tagger_root, tagger_file) in taggers {
         for entry in tagger_root.read_dir()? {
             let entry = entry?;
+            if TAGGER_FILE_NAMES.contains(
+                entry
+                    .file_name()
+                    .to_str()
+                    .context("{entry:?} filename not utf8")?,
+            ) {
+                continue;
+            }
+
             for tag in tags {
                 if let Some(ts) = tagger_file.has_match(tag, &entry.path()) {
                     for (t, hit) in ts {
