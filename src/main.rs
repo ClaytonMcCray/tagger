@@ -254,7 +254,7 @@ impl TaggerFile {
                 TaggerLine::Tag(f, tags) if target_file.is_file() => {
                     let filename_matcher = Regex::new(f).unwrap();
                     if !filename_matcher.is_match(&target_filename) {
-                        return None;
+                        continue;
                     }
                     for t in tags {
                         if target_tag.is_match(t) {
