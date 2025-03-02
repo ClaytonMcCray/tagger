@@ -137,7 +137,7 @@ fn get_intersection_of_tag_hits(map: BTreeMap<String, BTreeSet<String>>) -> BTre
     intersection.unwrap_or_default()
 }
 
-fn generate_tagger_pair(entry: &DirEntry) -> anyhow::Result<Option<(String, TaggerFile)>> {
+fn generate_tagger_pair(entry: &DirEntry) -> anyhow::Result<Option<(PathBuf, TaggerFile)>> {
     if !TAGGER_FILE_NAMES.contains(
         entry
             .file_name()
@@ -150,17 +150,16 @@ fn generate_tagger_pair(entry: &DirEntry) -> anyhow::Result<Option<(String, Tagg
     let parent = entry
         .path()
         .parent()
-        .map(|p| p.to_str())
-        .flatten()
-        .context("no parent found")?;
+        .context("no parent found")?
+        .canonicalize()?;
 
     Ok(Some((
-        parent.to_string(),
+        parent,
         TaggerFile::new(std::fs::read_to_string(entry.path())?)?,
     )))
 }
 
-fn generate_taggers(dir: &Path) -> anyhow::Result<HashMap<String, TaggerFile>> {
+fn generate_taggers(dir: &Path) -> anyhow::Result<HashMap<PathBuf, TaggerFile>> {
     let mut taggers = HashMap::new();
     let mut dir_iter = WalkDir::new(dir).follow_links(false).into_iter();
 
@@ -177,35 +176,16 @@ fn process_directory_tree(dir: &Path, tags: &Vec<String>) -> anyhow::Result<Tagg
     let mut tag_hits = TaggedFiles::default();
     let taggers = generate_taggers(dir)?;
 
-    let mut dir_iter = WalkDir::new(dir).follow_links(false).into_iter();
-
-    while let Some(Ok(entry)) = dir_iter.next() {
-        if TAGGER_FILE_NAMES.contains(
-            entry
-                .file_name()
-                .to_str()
-                .context("{entry:?} filename not utf8")?,
-        ) {
-            continue;
-        }
-
-        let parent = entry
-            .path()
-            .parent()
-            .map(|p| p.to_str())
-            .flatten()
-            .context("no parent found")?;
-        match taggers.get(parent) {
-            Some(tagger_file) => {
-                for tag in tags {
-                    if let Some(ts) = tagger_file.has_match(tag, entry.path()) {
-                        for (t, hit) in ts {
-                            tag_hits.add(t, hit.as_path())?;
-                        }
+    for (tagger_root, tagger_file) in taggers {
+        for entry in tagger_root.read_dir()? {
+            let entry = entry?;
+            for tag in tags {
+                if let Some(ts) = tagger_file.has_match(tag, &entry.path()) {
+                    for (t, hit) in ts {
+                        tag_hits.add(t, hit.as_path())?;
                     }
                 }
             }
-            None => {}
         }
     }
 
