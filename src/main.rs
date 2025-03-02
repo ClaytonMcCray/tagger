@@ -148,6 +148,15 @@ fn process_directory_tree(dir: &Path, tags: &Vec<String>) -> anyhow::Result<Tagg
     let mut dir_iter = WalkDir::new(dir).follow_links(false).into_iter();
 
     while let Some(Ok(entry)) = dir_iter.next() {
+        if TAGGER_FILE_NAMES.contains(
+            entry
+                .file_name()
+                .to_str()
+                .context("{entry:?} filename not utf8")?,
+        ) {
+            continue;
+        }
+
         let parent = entry
             .path()
             .parent()
