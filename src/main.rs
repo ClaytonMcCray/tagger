@@ -20,6 +20,10 @@ struct Args {
     #[arg(long, short)]
     dirs: Option<Vec<std::path::PathBuf>>,
 
+    #[arg(long, action=clap::ArgAction::SetTrue)]
+    #[serde(default)]
+    or: bool,
+
     /// Regular expressions representing the tags to match on.
     /// Leave out for interactive mode.
     #[arg()]
@@ -49,6 +53,7 @@ fn main() -> anyhow::Result<()> {
                 .expect("globbing")
         });
         new_args.tags = args.tags;
+        new_args.or = if args.or { args.or } else { new_args.or };
         new_args
     } else {
         args
@@ -77,7 +82,17 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    println!("{}", serde_yaml::to_string(&deduplicated)?);
+    if args.or {
+        println!("{}", serde_yaml::to_string(&deduplicated)?);
+    } else {
+        println!(
+            "{}",
+            serde_yaml::to_string(&BTreeMap::from_iter([(
+                tags.join(", "),
+                get_intersection_of_tag_hits(deduplicated)
+            )]))?
+        );
+    }
 
     if interactive {
         wait_for_input()?;
@@ -103,6 +118,23 @@ fn interactive_get_tags() -> Result<Vec<String>, io::Error> {
         .map(str::trim)
         .map(str::to_string)
         .collect())
+}
+
+fn get_intersection_of_tag_hits(map: BTreeMap<String, BTreeSet<String>>) -> BTreeSet<String> {
+    if map.is_empty() {
+        return BTreeSet::default();
+    }
+
+    let mut intersection: Option<BTreeSet<String>> = None;
+    for (_, set) in map {
+        if intersection.is_none() {
+            intersection = Some(set);
+        } else {
+            intersection = Some(intersection.unwrap().intersection(&set).cloned().collect());
+        }
+    }
+
+    intersection.unwrap_or_default()
 }
 
 fn generate_tagger_pair(entry: &DirEntry) -> anyhow::Result<Option<(String, TaggerFile)>> {
