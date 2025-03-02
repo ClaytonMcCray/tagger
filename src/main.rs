@@ -59,10 +59,15 @@ fn main() -> anyhow::Result<()> {
         args
     };
 
-    let (interactive, tags) = match args.tags {
+    let (interactive, raw_tags) = match args.tags {
         Some(tags) => (false, tags),
         None => (true, interactive_get_tags()?),
     };
+
+    let tags = raw_tags
+        .iter()
+        .map(|t| Regex::new(t))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let results = args
         .dirs
@@ -88,7 +93,7 @@ fn main() -> anyhow::Result<()> {
         println!(
             "{}",
             serde_yaml::to_string(&BTreeMap::from_iter([(
-                tags.join(", "),
+                raw_tags.join(", "),
                 get_intersection_of_tag_hits(deduplicated)
             )]))?
         );
@@ -172,7 +177,7 @@ fn generate_taggers(dir: &Path) -> anyhow::Result<HashMap<PathBuf, TaggerFile>> 
     Ok(taggers)
 }
 
-fn process_directory_tree(dir: &Path, tags: &Vec<String>) -> anyhow::Result<TaggedFiles> {
+fn process_directory_tree(dir: &Path, tags: &Vec<Regex>) -> anyhow::Result<TaggedFiles> {
     let mut tag_hits = TaggedFiles::default();
     let taggers = generate_taggers(dir)?;
 
@@ -208,9 +213,27 @@ impl TaggedFiles {
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
-enum TaggerLine {
+enum TaggerLineRaw {
     Tag(String, Vec<String>),
     DirTag(Vec<String>),
+}
+
+#[derive(Debug)]
+enum TaggerLine {
+    Tag(Regex, Vec<String>),
+    DirTag(Vec<String>),
+}
+
+impl From<TaggerLineRaw> for TaggerLine {
+    fn from(input: TaggerLineRaw) -> TaggerLine {
+        match input {
+            TaggerLineRaw::Tag(f, tags) => TaggerLine::Tag(
+                Regex::new(&f).expect("filename specifiers must be regexes"),
+                tags,
+            ),
+            TaggerLineRaw::DirTag(tags) => TaggerLine::DirTag(tags),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -218,22 +241,17 @@ struct TaggerFile(Vec<TaggerLine>);
 
 impl TaggerFile {
     fn new(yaml: String) -> Result<Self, serde_yaml::Error> {
-        Ok(Self(serde_yaml::from_str(&yaml)?))
+        let lines: Vec<TaggerLineRaw> = serde_yaml::from_str(&yaml)?;
+        Ok(Self(lines.into_iter().map(TaggerLine::from).collect()))
     }
 
-    fn has_match(
-        &self,
-        target_tag: &String,
-        target_file: &Path,
-    ) -> Option<Vec<(&String, PathBuf)>> {
-        let target_tag = Regex::new(target_tag).unwrap();
+    fn has_match(&self, target_tag: &Regex, target_file: &Path) -> Option<Vec<(&String, PathBuf)>> {
         let target_filename = target_file.file_name()?.to_string_lossy();
         let mut matches = vec![];
         for line in &self.0 {
             match line {
                 TaggerLine::Tag(f, tags) if target_file.is_file() => {
-                    let filename_matcher = Regex::new(f).unwrap();
-                    if !filename_matcher.is_match(&target_filename) {
+                    if !f.is_match(&target_filename) {
                         continue;
                     }
                     for t in tags {
